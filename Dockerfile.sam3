@@ -1,0 +1,58 @@
+# 1. Base Image: CUDA 12.8 on Ubuntu 24.04 (Noble Numbat)
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+# 2. Hardware Setup for RTX 5060 Ti (Blackwell sm_120)
+ENV TORCH_CUDA_ARCH_LIST="8.6 8.9 12.0"
+ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 3. Allow pip to install globally (Required for Ubuntu 24.04+)
+# Without this, pip will fail with "externally-managed-environment" error
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# 4. Install System Dependencies
+# Ubuntu 24.04 already has Python 3.12 as the default 'python3'
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    python3-wheel \
+    python3-setuptools \
+    git \
+    git-lfs \
+    wget \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    ninja-build \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
+
+# 5. Create 'python' alias (Ubuntu only ships with 'python3')
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+# 6. (SKIPPED PIP UPGRADE) 
+# We rely on the apt-provided pip to avoid the "exit code 1" error.
+# We just upgrade setuptools and wheel which is safe.
+# We do not need to upgrade the pip,setuptools and wheels, they are managed by Ubuntu 24.04
+#RUN pip install --upgrade setuptools wheel
+
+# 7. Install PyTorch Stable 2.9.1 (Compatible with CUDA 12.8)
+RUN pip install torch==2.9.1 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 8. Install SAM 3
+WORKDIR /home/appuser
+# We clone into a specific folder to keep things organized
+RUN git clone https://github.com/facebookresearch/sam3.git
+
+WORKDIR /home/appuser/sam3
+
+# 9. Install SAM 3 Dependencies
+# We install the 'notebooks' extra as well so you can run demos
+RUN pip install -e . && \
+    pip install -e ".[notebooks]" && \
+    pip install --upgrade huggingface_hub

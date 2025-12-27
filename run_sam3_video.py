@@ -10,16 +10,13 @@ import math
 import time
 import psutil
 import subprocess
+from datetime import datetime
 from PIL import Image
 from tqdm import tqdm
 
 # Add the repository root to sys.path
 repo_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(repo_root)
-
-# Only import sam3 components if in worker mode to avoid overhead in parent/coordinator
-# (Wait, actually if we are in main script we need to re-import in worker anyway)
-# But we can conditionally import.
 
 def setup_args():
     parser = argparse.ArgumentParser(description="Run SAM3 on a video processing in chunks.")
@@ -32,10 +29,17 @@ def setup_args():
     parser.add_argument("--chunk_duration", type=float, default=5.0, help="Duration of each chunk in minutes.")
     parser.add_argument("--fps", type=float, default=5.0, help="Target FPS for processing.")
     
+    # New Targeted Processing Args
+    parser.add_argument("--start_time", type=float, help="Start time (sec) for targeted processing.")
+    parser.add_argument("--end_time", type=float, help="End time (sec) for targeted processing.")
+    parser.add_argument("--video_start_timestamp", type=float, help="Epoch timestamp of video start for file naming.")
+    
     # Worker Mode Args
     parser.add_argument("--worker_mode", action="store_true", help="Run in worker mode (internal use).")
     parser.add_argument("--frames_dir", type=str, help="Directory of frames to process (Worker mode).")
     parser.add_argument("--chunk_idx", type=int, help="Index of the chunk being processed (Worker mode).")
+    parser.add_argument("--video_fps", type=float, help="Original FPS of the video (passed from Coordinator).")
+    parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision for improved VRAM/performance.")
     
     return parser.parse_args()
 
@@ -93,8 +97,12 @@ def worker_main(args):
             gpus_to_use=gpus_to_use,
             checkpoint_path=model_path
         )
+        if args.use_bfloat16:
+            print(f"  [Worker {chunk_idx}] Casting model to bfloat16...")
+            predictor.model.to(dtype=torch.bfloat16)
+            
     except Exception as e:
-         print(f"  [Worker {chunk_idx}] Error building predictor: {e}")
+         print(f"  [Worker {chunk_idx}] Error building/casting predictor: {e}")
          return
     print(f"  [Worker {chunk_idx}] Model built in {time.time() - t0:.1f}s")
     
@@ -139,25 +147,52 @@ def worker_main(args):
         frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
         num_frames = len(frame_files)
         
-        stream_generator = predictor.handle_stream_request(
-            request=dict(
-                type="propagate_in_video",
-                session_id=session_id,
-            )
-        )
+        # Use autocast context if bfloat16 is requested for safety in ops
+        # Although model weights are cast, some ops prefer explicit context
+        ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.use_bfloat16 else torch.no_grad()
+        # Note: torch.no_grad() is already implicit or handled? 
+        # Actually inference_mode is used in handle_stream_request.
+        # But autocast is good.
         
-        for response in stream_generator:
-            current_iter += 1
-            outputs_per_frame[response["frame_index"]] = response["outputs"]
-            
-            if current_iter % 10 == 0:
-                t_now = time.time()
-                elapsed = t_now - t_last_log
-                speed = 10 / elapsed if elapsed > 0 else 0
-                stats = monitor.get_stats()
-                print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
-                t_last_log = t_now
+        # We need to wrap the generator iteration
+        if args.use_bfloat16:
+             with torch.autocast("cuda", dtype=torch.bfloat16):
+                  stream_generator = predictor.handle_stream_request(
+                    request=dict(
+                        type="propagate_in_video",
+                        session_id=session_id,
+                    )
+                  )
+                  for response in stream_generator:
+                        current_iter += 1
+                        outputs_per_frame[response["frame_index"]] = response["outputs"]
+                        
+                        if current_iter % 10 == 0:
+                            t_now = time.time()
+                            elapsed = t_now - t_last_log
+                            speed = 10 / elapsed if elapsed > 0 else 0
+                            stats = monitor.get_stats()
+                            print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
+                            t_last_log = t_now
+        else:
+             stream_generator = predictor.handle_stream_request(
+                request=dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                )
+             )
+             for response in stream_generator:
+                current_iter += 1
+                outputs_per_frame[response["frame_index"]] = response["outputs"]
                 
+                if current_iter % 10 == 0:
+                    t_now = time.time()
+                    elapsed = t_now - t_last_log
+                    speed = 10 / elapsed if elapsed > 0 else 0
+                    stats = monitor.get_stats()
+                    print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
+                    t_last_log = t_now
+
     except Exception as e:
         print(f"  [Worker {chunk_idx}] Error during propagation: {e}")
         return
@@ -171,12 +206,27 @@ def worker_main(args):
             continue
         
         frame_path = frame_files[local_frame_idx]
-        original_frame_name = os.path.basename(frame_path)
-        
         frame_image = np.array(Image.open(frame_path))
         overlay = render_masklet_frame(frame_image, outputs, frame_idx=local_frame_idx)
         
-        save_path = os.path.join(output_dir, original_frame_name)
+        # Naming Logic
+        out_filename = os.path.basename(frame_path) 
+        
+        if args.video_start_timestamp and args.video_fps and args.video_fps > 0:
+            try:
+                # Video Filename Frame Number (from extraction)
+                original_frame_num = int(os.path.splitext(os.path.basename(frame_path))[0])
+                
+                # Calculate time
+                time_offset_sec = original_frame_num / args.video_fps
+                frame_ts = args.video_start_timestamp + time_offset_sec
+                frame_dt = datetime.fromtimestamp(frame_ts)
+                
+                out_filename = frame_dt.strftime("%Y.%m.%d_%Hh%Mm%Ss_%f") + ".jpg"
+            except Exception as e:
+                print(f"Warning: Could not format timestamp for {frame_path}: {e}")
+
+        save_path = os.path.join(output_dir, out_filename)
         Image.fromarray(overlay).save(save_path)
     
     print(f"  [Worker {chunk_idx}] Done.")
@@ -185,10 +235,6 @@ def worker_main(args):
 # ==================== Coordinator Logic ====================
 
 def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fps, temp_dir):
-    """
-    Extract frames from video_path between start_time and end_time at target_fps.
-    Save them to temp_dir.
-    """
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
@@ -199,14 +245,13 @@ def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fp
     
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     
-    # Calculate start and end frames
     start_frame = int(start_time_sec * video_fps)
     end_frame = int(end_time_sec * video_fps)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     if start_frame >= total_frames:
         cap.release()
-        return False # End of video
+        return False, video_fps
     
     end_frame = min(end_frame, total_frames)
     
@@ -225,6 +270,7 @@ def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fp
             break
             
         if current_frame % frame_step == 0:
+            # Save as 00000123.jpg (Video Frame Number)
             save_path = os.path.join(temp_dir, f"{current_frame:08d}.jpg")
             cv2.imwrite(save_path, frame)
             saved_count += 1
@@ -232,13 +278,14 @@ def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fp
         current_frame += 1
     
     cap.release()
-    return saved_count > 0
+    return saved_count > 0, video_fps
 
 def coordinator_main(args):
-    # 2. Get Video Info
     if not args.video_path:
         print("Error: --video_path is required in coordinator mode.")
         return
+
+    is_targeted = (args.start_time is not None) and (args.end_time is not None)
 
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
@@ -249,21 +296,26 @@ def coordinator_main(args):
     duration_sec = total_frames / video_fps
     cap.release()
     
-    print(f"Video Duration: {duration_sec:.2f}s ({total_frames} frames, {video_fps} fps)")
-    
-    chunk_duration_sec = args.chunk_duration * 60
-    num_chunks = math.ceil(duration_sec / chunk_duration_sec)
-    
+    if is_targeted:
+        chunks = [(args.start_time, args.end_time)]
+        print(f"Processing Target Interval: {args.start_time}s to {args.end_time}s")
+    else:
+        print(f"Video Duration: {duration_sec:.2f}s ({total_frames} frames, {video_fps} fps)")
+        chunk_duration_sec = args.chunk_duration * 60
+        num_chunks = math.ceil(duration_sec / chunk_duration_sec)
+        chunks = []
+        for i in range(num_chunks):
+            start = i * chunk_duration_sec
+            end = min((i + 1) * chunk_duration_sec, duration_sec)
+            chunks.append((start, end))
+
     temp_frames_dir = os.path.join(args.output_dir, "temp_frames_buffer")
     
-    # 3. Process Loops
-    for i in range(num_chunks):
-        start_time = i * chunk_duration_sec
-        end_time = min((i + 1) * chunk_duration_sec, duration_sec)
+    for i, (start_time, end_time) in enumerate(chunks):
         
-        print(f"\nProcessing Chunk {i+1}/{num_chunks}...")
+        print(f"\nProcessing Chunk {i+1}...")
         
-        has_frames = extract_frames_for_chunk(
+        has_frames, vid_fps = extract_frames_for_chunk(
             args.video_path, 
             start_time, 
             end_time, 
@@ -272,9 +324,7 @@ def coordinator_main(args):
         )
         
         if has_frames:
-            # Launch Worker Process
-            print(f"Launching worker process for Chunk {i+1}...")
-            
+            print(f"Launching worker process...")
             cmd = [
                 sys.executable,
                 __file__,
@@ -284,18 +334,23 @@ def coordinator_main(args):
                 "--prompt", args.prompt,
                 "--model_path", args.model_path,
                 "--chunk_idx", str(i+1),
-                "--fps", str(args.fps), # Just to satisfy arg parser
+                "--fps", str(args.fps), 
+                "--video_fps", str(vid_fps) 
             ]
             
+            if args.video_start_timestamp:
+                cmd.extend(["--video_start_timestamp", str(args.video_start_timestamp)])
+            
+            if args.use_bfloat16:
+                cmd.append("--use_bfloat16")
+
             try:
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError as e:
-                print(f"Worker process for Chunk {i+1} failed with error: {e}")
-                # Optional: break or continue? Let's continue.
+                print(f"Worker process failed: {e}")
         else:
             print(f"Skipping chunk {i+1} (no frames extracted).")
             
-    # Cleanup
     if os.path.exists(temp_frames_dir):
         shutil.rmtree(temp_frames_dir)
         

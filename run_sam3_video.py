@@ -7,6 +7,9 @@ import glob
 import numpy as np
 import shutil
 import math
+import time
+import psutil
+import subprocess
 from PIL import Image
 from tqdm import tqdm
 
@@ -14,42 +17,105 @@ from tqdm import tqdm
 repo_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(repo_root)
 
-import sam3
-from sam3.model_builder import build_sam3_video_predictor
-from sam3.visualization_utils import render_masklet_frame
+# Only import sam3 components if in worker mode to avoid overhead in parent/coordinator
+# (Wait, actually if we are in main script we need to re-import in worker anyway)
+# But we can conditionally import.
 
 def setup_args():
     parser = argparse.ArgumentParser(description="Run SAM3 on a video processing in chunks.")
-    parser.add_argument("--video_path", type=str, required=True, help="Path to the video file.")
-    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for segmentation (e.g., 'car').")
+    
+    # Common Args
+    parser.add_argument("--video_path", type=str, required=False, help="Path to the video file (Coordinator mode).")
+    parser.add_argument("--prompt", type=str, required=True, help="Text prompt for segmentation.")
     parser.add_argument("--output_dir", type=str, default="output_sam3", help="Directory to save visualized outputs.")
     parser.add_argument("--model_path", type=str, default="checkpoints/sam3.pt", help="Path to the SAM3 checkpoint file.")
     parser.add_argument("--chunk_duration", type=float, default=5.0, help="Duration of each chunk in minutes.")
     parser.add_argument("--fps", type=float, default=5.0, help="Target FPS for processing.")
+    
+    # Worker Mode Args
+    parser.add_argument("--worker_mode", action="store_true", help="Run in worker mode (internal use).")
+    parser.add_argument("--frames_dir", type=str, help="Directory of frames to process (Worker mode).")
+    parser.add_argument("--chunk_idx", type=int, help="Index of the chunk being processed (Worker mode).")
+    
     return parser.parse_args()
 
-def process_chunk(chunk_idx, frames_dir, prompt, predictor, output_dir):
-    """
-    Process a single chunk of frames (already saved in frames_dir).
-    """
+class SystemMonitor:
+    def __init__(self):
+        self.process = psutil.Process(os.getpid())
+        
+    def get_stats(self):
+        # CPU
+        cpu_percent = psutil.cpu_percent(interval=None)
+        
+        # RAM
+        ram_info = psutil.virtual_memory()
+        ram_used_gb = ram_info.used / (1024**3)
+        ram_total_gb = ram_info.total / (1024**3)
+        
+        # GPU
+        gpu_stats = "N/A"
+        if torch.cuda.is_available():
+            try:
+                # Using torch.cuda to get memory info for device 0 (simplification)
+                # Note: this is memory allocated by PyTorch, not total system VRAM usage
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                gpu_stats = f"{allocated:.1f}GB alloc / {reserved:.1f}GB res"
+            except:
+                 gpu_stats = "Err"
+                 
+        return f"CPU: {cpu_percent:.1f}% | RAM: {ram_used_gb:.1f}/{ram_total_gb:.1f}GB | GPU: {gpu_stats}"
+
+# ==================== Worker Logic ====================
+
+def worker_main(args):
+    # Delayed inputs to save import time in parent
+    import sam3
+    from sam3.model_builder import build_sam3_video_predictor
+    from sam3.visualization_utils import render_masklet_frame
+    
+    chunk_idx = args.chunk_idx
+    frames_dir = args.frames_dir
+    prompt = args.prompt
+    model_path = args.model_path
+    output_dir = args.output_dir
+    
+    monitor = SystemMonitor()
+    print(f"  [Worker {chunk_idx}] Process Started. PID: {os.getpid()}")
+    print(f"  [Worker {chunk_idx}] Initial Stats: {monitor.get_stats()}")
+
+    # 0. Build Predictor
+    print(f"  [Worker {chunk_idx}] Building SAM3 predictor...")
+    t0 = time.time()
+    gpus_to_use = range(torch.cuda.device_count())
+    try:
+        predictor = build_sam3_video_predictor(
+            gpus_to_use=gpus_to_use,
+            checkpoint_path=model_path
+        )
+    except Exception as e:
+         print(f"  [Worker {chunk_idx}] Error building predictor: {e}")
+         return
+    print(f"  [Worker {chunk_idx}] Model built in {time.time() - t0:.1f}s")
+    
     # 1. Start Session
-    print(f"  [Chunk {chunk_idx}] Starting inference session...")
+    print(f"  [Worker {chunk_idx}] Starting inference session...")
     try:
         response = predictor.handle_request(
             request=dict(
                 type="start_session",
-                resource_path=frames_dir, # Pass the directory of frames
+                resource_path=frames_dir,
             )
         )
         session_id = response["session_id"]
     except Exception as e:
-        print(f"  [Chunk {chunk_idx}] Error starting session: {e}")
+        print(f"  [Worker {chunk_idx}] Error starting session: {e}")
         return
 
-    # 2. Add Text Prompt (Always at frame 0 of the chunk, treating it as a fresh video)
-    print(f"  [Chunk {chunk_idx}] Adding prompt '{prompt}' at frame 0...")
+    # 2. Add Prompt
+    print(f"  [Worker {chunk_idx}] Adding prompt '{prompt}'...")
     try:
-        response = predictor.handle_request(
+        predictor.handle_request(
             request=dict(
                 type="add_prompt",
                 session_id=session_id,
@@ -58,36 +124,48 @@ def process_chunk(chunk_idx, frames_dir, prompt, predictor, output_dir):
             )
         )
     except Exception as e:
-        print(f"  [Chunk {chunk_idx}] Error adding prompt: {e}")
-        return
+         print(f"  [Worker {chunk_idx}] Error adding prompt: {e}")
+         return
 
     # 3. Propagate
-    print(f"  [Chunk {chunk_idx}] Propagating masks...")
+    print(f"  [Worker {chunk_idx}] Propagating masks...")
+    
     outputs_per_frame = {}
+    current_iter = 0
+    t_start = time.time()
+    t_last_log = t_start
+    
     try:
-        for response in predictor.handle_stream_request(
+        frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+        num_frames = len(frame_files)
+        
+        stream_generator = predictor.handle_stream_request(
             request=dict(
                 type="propagate_in_video",
                 session_id=session_id,
             )
-        ):
+        )
+        
+        for response in stream_generator:
+            current_iter += 1
             outputs_per_frame[response["frame_index"]] = response["outputs"]
+            
+            if current_iter % 10 == 0:
+                t_now = time.time()
+                elapsed = t_now - t_last_log
+                speed = 10 / elapsed if elapsed > 0 else 0
+                stats = monitor.get_stats()
+                print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
+                t_last_log = t_now
+                
     except Exception as e:
-        print(f"  [Chunk {chunk_idx}] Error during propagation: {e}")
+        print(f"  [Worker {chunk_idx}] Error during propagation: {e}")
         return
 
     # 4. Visualize and Save
-    frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-    
-    # Create a subfolder for this chunk's outputs to avoid name collisions/confusion
-    # or save with original frame names if possible.
-    # The user said "treat each ... as separate video files", so separate folders might be cleaner,
-    # but a single unified folder is often preferred for valid outputs.
-    # Let's use a unified folder but preserve the filenames we generated (which are probably 8-digit frame indices).
-    
     os.makedirs(output_dir, exist_ok=True)
-
-    print(f"  [Chunk {chunk_idx}] Saving visualizations to {output_dir}...")
+    print(f"  [Worker {chunk_idx}] Saving visualizations to {output_dir}...")
+    
     for local_frame_idx, outputs in outputs_per_frame.items():
         if local_frame_idx >= len(frame_files):
             continue
@@ -101,9 +179,10 @@ def process_chunk(chunk_idx, frames_dir, prompt, predictor, output_dir):
         save_path = os.path.join(output_dir, original_frame_name)
         Image.fromarray(overlay).save(save_path)
     
-    # 5. Reset/Close Session to free memory
-    predictor.handle_request(request=dict(type="close_session", session_id=session_id))
-    print(f"  [Chunk {chunk_idx}] Done.")
+    print(f"  [Worker {chunk_idx}] Done.")
+
+
+# ==================== Coordinator Logic ====================
 
 def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fps, temp_dir):
     """
@@ -145,11 +224,7 @@ def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fp
         if not ret:
             break
             
-        # Only save if it aligns with the step relative to the START of the video (to maintain consistent FPS spacing)
-        # OR just relative to start of chunk? 
-        # Using (current_frame % frame_step == 0) aligns it globally.
         if current_frame % frame_step == 0:
-            # Save with frame index to keep global ordering in valid filenames
             save_path = os.path.join(temp_dir, f"{current_frame:08d}.jpg")
             cv2.imwrite(save_path, frame)
             saved_count += 1
@@ -159,25 +234,12 @@ def extract_frames_for_chunk(video_path, start_time_sec, end_time_sec, target_fp
     cap.release()
     return saved_count > 0
 
-def main():
-    args = setup_args()
-    
-    # 1. Setup SAM3 Predictor
-    print("Building SAM3 video predictor...")
-    gpus_to_use = range(torch.cuda.device_count())
-    if not gpus_to_use:
-        print("Warning: No CUDA devices found.")
-    
-    try:
-        predictor = build_sam3_video_predictor(
-            gpus_to_use=gpus_to_use,
-            checkpoint_path=args.model_path
-        )
-    except Exception as e:
-         print(f"Error building predictor: {e}")
-         return
-
+def coordinator_main(args):
     # 2. Get Video Info
+    if not args.video_path:
+        print("Error: --video_path is required in coordinator mode.")
+        return
+
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
         print(f"Error: Cannot open video {args.video_path}")
@@ -197,9 +259,6 @@ def main():
     # 3. Process Loops
     for i in range(num_chunks):
         start_time = i * chunk_duration_sec
-        
-        # NOTE: We iterate until the end of video, effectively treating each chunk as a segment.
-        # But we must stop extracting when we hit the end of the chunk duration.
         end_time = min((i + 1) * chunk_duration_sec, duration_sec)
         
         print(f"\nProcessing Chunk {i+1}/{num_chunks}...")
@@ -213,7 +272,26 @@ def main():
         )
         
         if has_frames:
-            process_chunk(i+1, temp_frames_dir, args.prompt, predictor, args.output_dir)
+            # Launch Worker Process
+            print(f"Launching worker process for Chunk {i+1}...")
+            
+            cmd = [
+                sys.executable,
+                __file__,
+                "--worker_mode",
+                "--frames_dir", temp_frames_dir,
+                "--output_dir", args.output_dir,
+                "--prompt", args.prompt,
+                "--model_path", args.model_path,
+                "--chunk_idx", str(i+1),
+                "--fps", str(args.fps), # Just to satisfy arg parser
+            ]
+            
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Worker process for Chunk {i+1} failed with error: {e}")
+                # Optional: break or continue? Let's continue.
         else:
             print(f"Skipping chunk {i+1} (no frames extracted).")
             
@@ -222,6 +300,13 @@ def main():
         shutil.rmtree(temp_frames_dir)
         
     print(f"\nAll Done! Results saved to {args.output_dir}")
+
+def main():
+    args = setup_args()
+    if args.worker_mode:
+        worker_main(args)
+    else:
+        coordinator_main(args)
 
 if __name__ == "__main__":
     main()

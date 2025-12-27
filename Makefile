@@ -23,6 +23,8 @@ run-sam3:
 	-p 8888:8888 \
 	-v /tmp/.X11-unix:/tmp/.X11-unix \
 	-v "$(PWD)":/home/appuser/workspace \
+	-v /mnt/d:/mnt/d \
+	-v /mnt/e:/mnt/e \
 	-w /home/appuser/workspace \
 	-e DISPLAY=$(DISPLAY) \
 	--name=sam3_v1 \

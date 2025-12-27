@@ -55,4 +55,5 @@ WORKDIR /home/appuser/sam3
 # We install the 'notebooks' extra as well so you can run demos
 RUN pip install -e . && \
     pip install -e ".[notebooks]" && \
-    pip install --upgrade huggingface_hub
+    pip install --upgrade huggingface_hub &&\
+    pip install --no-cache-dir pandas

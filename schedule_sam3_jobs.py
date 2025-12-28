@@ -16,6 +16,7 @@ def setup_args():
     parser.add_argument("--fps", type=float, default=3.0, help="FPS for SAM3.")
     parser.add_argument("--min_duration", type=float, default=5.0, help="Min duration (sec) to keep interval.")
     parser.add_argument("--max_duration", type=float, default=20.0, help="Max duration (sec) per job. Splits long intervals.")
+    parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision.")
     parser.add_argument("--dry_run", action="store_true", help="Print jobs without running.")
     return parser.parse_args()
 
@@ -156,6 +157,9 @@ def main():
             "--end_time", str(job['end_offset']),
             "--video_start_timestamp", str(job['video_start_ts'])
         ]
+        
+        if args.use_bfloat16:
+            cmd.append("--use_bfloat16")
         
         if args.dry_run:
             print(f"  Command: {' '.join(cmd)}")

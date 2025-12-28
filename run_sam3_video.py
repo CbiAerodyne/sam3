@@ -13,6 +13,7 @@ import subprocess
 from datetime import datetime
 from PIL import Image
 from tqdm import tqdm
+from contextlib import nullcontext
 
 # Add the repository root to sys.path
 repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -97,24 +98,26 @@ def worker_main(args):
             gpus_to_use=gpus_to_use,
             checkpoint_path=model_path
         )
-        if args.use_bfloat16:
-            print(f"  [Worker {chunk_idx}] Casting model to bfloat16...")
-            predictor.model.to(dtype=torch.bfloat16)
+        # We rely on torch.autocast for bfloat16, manual casting caused mismatches.
             
     except Exception as e:
-         print(f"  [Worker {chunk_idx}] Error building/casting predictor: {e}")
+         print(f"  [Worker {chunk_idx}] Error building predictor: {e}")
          return
     print(f"  [Worker {chunk_idx}] Model built in {time.time() - t0:.1f}s")
     
+    # Context Manager Helper
+    autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.use_bfloat16 else nullcontext()
+
     # 1. Start Session
     print(f"  [Worker {chunk_idx}] Starting inference session...")
     try:
-        response = predictor.handle_request(
-            request=dict(
-                type="start_session",
-                resource_path=frames_dir,
+        with autocast_ctx:
+            response = predictor.handle_request(
+                request=dict(
+                    type="start_session",
+                    resource_path=frames_dir,
+                )
             )
-        )
         session_id = response["session_id"]
     except Exception as e:
         print(f"  [Worker {chunk_idx}] Error starting session: {e}")
@@ -123,14 +126,15 @@ def worker_main(args):
     # 2. Add Prompt
     print(f"  [Worker {chunk_idx}] Adding prompt '{prompt}'...")
     try:
-        predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=0,
-                text=prompt,
+        with autocast_ctx:
+            predictor.handle_request(
+                request=dict(
+                    type="add_prompt",
+                    session_id=session_id,
+                    frame_index=0,
+                    text=prompt,
+                )
             )
-        )
     except Exception as e:
          print(f"  [Worker {chunk_idx}] Error adding prompt: {e}")
          return
@@ -147,41 +151,15 @@ def worker_main(args):
         frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
         num_frames = len(frame_files)
         
-        # Use autocast context if bfloat16 is requested for safety in ops
-        # Although model weights are cast, some ops prefer explicit context
-        ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.use_bfloat16 else torch.no_grad()
-        # Note: torch.no_grad() is already implicit or handled? 
-        # Actually inference_mode is used in handle_stream_request.
-        # But autocast is good.
-        
-        # We need to wrap the generator iteration
-        if args.use_bfloat16:
-             with torch.autocast("cuda", dtype=torch.bfloat16):
-                  stream_generator = predictor.handle_stream_request(
-                    request=dict(
-                        type="propagate_in_video",
-                        session_id=session_id,
-                    )
-                  )
-                  for response in stream_generator:
-                        current_iter += 1
-                        outputs_per_frame[response["frame_index"]] = response["outputs"]
-                        
-                        if current_iter % 10 == 0:
-                            t_now = time.time()
-                            elapsed = t_now - t_last_log
-                            speed = 10 / elapsed if elapsed > 0 else 0
-                            stats = monitor.get_stats()
-                            print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
-                            t_last_log = t_now
-        else:
-             stream_generator = predictor.handle_stream_request(
+        with autocast_ctx:
+            stream_generator = predictor.handle_stream_request(
                 request=dict(
                     type="propagate_in_video",
                     session_id=session_id,
                 )
-             )
-             for response in stream_generator:
+            )
+            
+            for response in stream_generator:
                 current_iter += 1
                 outputs_per_frame[response["frame_index"]] = response["outputs"]
                 
@@ -192,7 +170,7 @@ def worker_main(args):
                     stats = monitor.get_stats()
                     print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
                     t_last_log = t_now
-
+                
     except Exception as e:
         print(f"  [Worker {chunk_idx}] Error during propagation: {e}")
         return

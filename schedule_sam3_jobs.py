@@ -16,6 +16,9 @@ def setup_args():
     parser.add_argument("--fps", type=float, default=3.0, help="FPS for SAM3.")
     parser.add_argument("--min_duration", type=float, default=5.0, help="Min duration (sec) to keep interval.")
     parser.add_argument("--max_duration", type=float, default=20.0, help="Max duration (sec) per job. Splits long intervals.")
+    parser.add_argument("--DateTime_start", type=str, default="2025.08.05_20h48m11s", help="Start datetime (YYYY.MM.DD_HHhMMmSSs).")
+    parser.add_argument("--DateTime_stop", type=str, default="2025.09.21_00h33m57s", help="End datetime (YYYY.MM.DD_HHhMMmSSs).")
+    parser.add_argument("--no_postprocess", action="store_true", help="Skip the post-processing step.")
     parser.add_argument("--dry_run", action="store_true", help="Print jobs without running.")
     return parser.parse_args()
 
@@ -28,6 +31,17 @@ def parse_video_filename(filename):
         dt = datetime.strptime(dt_str, "%Y.%m.%d %H:%M:%S")
         return dt
     return None
+
+def parse_arg_time(t_str):
+    if not t_str:
+        return None
+    # Try user format YYYY.MM.DD_HHhMMmSSs
+    match = re.search(r"(\d{4}\.\d{2}\.\d{2})_(\d{2})h(\d{2})m(\d{2})s", t_str)
+    if match:
+        d, h, m, s = match.groups()
+        return pd.to_datetime(f"{d} {h}:{m}:{s}")
+    # Fallback to standard pandas parsing
+    return pd.to_datetime(t_str)
 
 def get_video_duration(video_path):
     import cv2
@@ -53,6 +67,22 @@ def main():
         
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.sort_values('timestamp', inplace=True)
+
+    # Filter by Global Time Range
+    start_dt = parse_arg_time(args.DateTime_start)
+    end_dt = parse_arg_time(args.DateTime_stop)
+
+    if start_dt:
+        print(f"Filtering data >= {start_dt}")
+        df = df[df['timestamp'] >= start_dt]
+    
+    if end_dt:
+        print(f"Filtering data <= {end_dt}")
+        df = df[df['timestamp'] <= end_dt]
+        
+    if df.empty:
+        print("No data remaining after filtering by global time range.")
+        return
     
     # 2. Scan Videos
     print(f"Scanning videos in {args.video_dir}...")
@@ -60,19 +90,18 @@ def main():
     video_index = [] 
     
     for v in video_files:
-        start_dt = parse_video_filename(os.path.basename(v))
-        if start_dt:
+        start_dt_vid = parse_video_filename(os.path.basename(v))
+        if start_dt_vid:
             duration = get_video_duration(v)
             if duration > 0:
-                end_dt = start_dt + timedelta(seconds=duration)
+                end_dt_vid = start_dt_vid + timedelta(seconds=duration)
                 video_index.append({
                     'path': v,
-                    'start': start_dt,
-                    'end': end_dt,
-                    'start_ts': start_dt.timestamp(),
-                    'end_ts': end_dt.timestamp()
+                    'start': start_dt_vid,
+                    'end': end_dt_vid,
+                    'start_ts': start_dt_vid.timestamp(),
+                    'end_ts': end_dt_vid.timestamp()
                 })
-                # print(f"  Found {os.path.basename(v)}: {start_dt} -> {end_dt} ({duration/60:.1f} min)")
     
     if not video_index:
         print("No valid videos found.")
@@ -119,7 +148,6 @@ def main():
             overlap_end = min(req_end, vid['end'])
             
             if overlap_start < overlap_end:
-                # Iterate through overlap in max_duration chunks
                 current_sub_start = overlap_start
                 while current_sub_start < overlap_end:
                     current_sub_end = min(current_sub_start + timedelta(seconds=args.max_duration), overlap_end)
@@ -164,6 +192,19 @@ def main():
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError as e:
                 print(f"  Job failed: {e}")
+
+    # 6. Run Post-Processing
+    if not args.no_postprocess and not args.dry_run:
+        print("\n[Post-Processing] Running metrics extraction...")
+        pp_cmd = [
+            sys.executable, "postprocess_sam3_results.py",
+            "--results_dir", args.output_dir
+        ]
+        try:
+            subprocess.run(pp_cmd, check=True)
+            print("[Post-Processing] Done.")
+        except subprocess.CalledProcessError as e:
+            print(f"[Post-Processing] Failed: {e}")
 
 if __name__ == "__main__":
     main()

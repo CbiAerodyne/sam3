@@ -10,6 +10,7 @@ import math
 import time
 import psutil
 import subprocess
+import pickle
 from datetime import datetime
 from PIL import Image
 from tqdm import tqdm
@@ -39,7 +40,6 @@ def setup_args():
     parser.add_argument("--frames_dir", type=str, help="Directory of frames to process (Worker mode).")
     parser.add_argument("--chunk_idx", type=int, help="Index of the chunk being processed (Worker mode).")
     parser.add_argument("--video_fps", type=float, help="Original FPS of the video (passed from Coordinator).")
-    parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision for improved VRAM/performance.")
     
     return parser.parse_args()
 
@@ -77,6 +77,7 @@ def worker_main(args):
     import sam3
     from sam3.model_builder import build_sam3_video_predictor
     from sam3.visualization_utils import render_masklet_frame
+    from torchvision.ops import masks_to_boxes
     
     chunk_idx = args.chunk_idx
     frames_dir = args.frames_dir
@@ -97,12 +98,8 @@ def worker_main(args):
             gpus_to_use=gpus_to_use,
             checkpoint_path=model_path
         )
-        if args.use_bfloat16:
-            print(f"  [Worker {chunk_idx}] Casting model to bfloat16...")
-            predictor.model.to(dtype=torch.bfloat16)
-            
     except Exception as e:
-         print(f"  [Worker {chunk_idx}] Error building/casting predictor: {e}")
+         print(f"  [Worker {chunk_idx}] Error building predictor: {e}")
          return
     print(f"  [Worker {chunk_idx}] Model built in {time.time() - t0:.1f}s")
     
@@ -147,58 +144,93 @@ def worker_main(args):
         frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
         num_frames = len(frame_files)
         
-        # Use autocast context if bfloat16 is requested for safety in ops
-        # Although model weights are cast, some ops prefer explicit context
-        ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.use_bfloat16 else torch.no_grad()
-        # Note: torch.no_grad() is already implicit or handled? 
-        # Actually inference_mode is used in handle_stream_request.
-        # But autocast is good.
+        stream_generator = predictor.handle_stream_request(
+            request=dict(
+                type="propagate_in_video",
+                session_id=session_id,
+            )
+        )
         
-        # We need to wrap the generator iteration
-        if args.use_bfloat16:
-             with torch.autocast("cuda", dtype=torch.bfloat16):
-                  stream_generator = predictor.handle_stream_request(
-                    request=dict(
-                        type="propagate_in_video",
-                        session_id=session_id,
-                    )
-                  )
-                  for response in stream_generator:
-                        current_iter += 1
-                        outputs_per_frame[response["frame_index"]] = response["outputs"]
-                        
-                        if current_iter % 10 == 0:
-                            t_now = time.time()
-                            elapsed = t_now - t_last_log
-                            speed = 10 / elapsed if elapsed > 0 else 0
-                            stats = monitor.get_stats()
-                            print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
-                            t_last_log = t_now
-        else:
-             stream_generator = predictor.handle_stream_request(
-                request=dict(
-                    type="propagate_in_video",
-                    session_id=session_id,
-                )
-             )
-             for response in stream_generator:
-                current_iter += 1
-                outputs_per_frame[response["frame_index"]] = response["outputs"]
+        for response in stream_generator:
+            current_iter += 1
+            outputs_per_frame[response["frame_index"]] = response["outputs"]
+            
+            if current_iter % 10 == 0:
+                t_now = time.time()
+                elapsed = t_now - t_last_log
+                speed = 10 / elapsed if elapsed > 0 else 0
+                stats = monitor.get_stats()
+                print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
+                t_last_log = t_now
                 
-                if current_iter % 10 == 0:
-                    t_now = time.time()
-                    elapsed = t_now - t_last_log
-                    speed = 10 / elapsed if elapsed > 0 else 0
-                    stats = monitor.get_stats()
-                    print(f"    [Worker {chunk_idx}] Frame {current_iter}/{num_frames} | {speed:.2f} it/s | {stats}")
-                    t_last_log = t_now
-
     except Exception as e:
         print(f"  [Worker {chunk_idx}] Error during propagation: {e}")
         return
 
-    # 4. Visualize and Save
+    # 4. Save Raw Results (Pickle)
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Prepare data for pickling: convert tensors to cpu/numpy/list where appropriate to avoid issues
+    # We want to save: filename, timestamp (if avail), obj_ids, boxes, scores
+    inference_results = []
+    
+    print(f"  [Worker {chunk_idx}] Saving inference results (pickle) to {output_dir}...")
+
+    for local_frame_idx, outputs in outputs_per_frame.items():
+        if local_frame_idx >= len(frame_files):
+            continue
+        
+        frame_path = frame_files[local_frame_idx]
+        
+        # Naming & Timestamp Logic
+        out_filename = os.path.basename(frame_path) 
+        frame_timestamp = None
+        
+        if args.video_start_timestamp and args.video_fps and args.video_fps > 0:
+            try:
+                original_frame_num = int(os.path.splitext(os.path.basename(frame_path))[0])
+                time_offset_sec = original_frame_num / args.video_fps
+                frame_timestamp = args.video_start_timestamp + time_offset_sec
+                frame_dt = datetime.fromtimestamp(frame_timestamp)
+                out_filename = frame_dt.strftime("%Y.%m.%d_%Hh%Mm%Ss_%f") + ".jpg"
+            except Exception:
+                pass
+
+        # Extract Metrics
+        # outputs keys: out_boxes_xywh, out_probs, out_obj_ids, out_binary_masks
+        
+        frame_data = {
+            "file": out_filename,
+            "timestamp": frame_timestamp,
+            "objects": []
+        }
+        
+        for i in range(len(outputs["out_probs"])):
+            obj_id = outputs["out_obj_ids"][i]
+            score = outputs["out_probs"][i]
+            box_xywh = outputs["out_boxes_xywh"][i] # Normalized [x, y, w, h]
+            
+            if isinstance(score, torch.Tensor): score = score.item()
+            if isinstance(obj_id, torch.Tensor): obj_id = obj_id.item()
+            if isinstance(box_xywh, torch.Tensor): box_xywh = box_xywh.tolist()
+            
+            frame_data["objects"].append({
+                "id": obj_id,
+                "score": score,
+                "box": box_xywh
+            })
+            
+        inference_results.append(frame_data)
+
+    pkl_filename = f"inference_results_chunk_{args.chunk_idx}_{int(time.time())}.pkl"
+    pkl_path = os.path.join(output_dir, pkl_filename)
+    
+    with open(pkl_path, "wb") as f:
+        pickle.dump(inference_results, f)
+        
+    print(f"  [Worker {chunk_idx}] Saved {len(inference_results)} frames of data to {pkl_filename}")
+
+    # 5. Visualize (Images)
     print(f"  [Worker {chunk_idx}] Saving visualizations to {output_dir}...")
     
     for local_frame_idx, outputs in outputs_per_frame.items():
@@ -206,26 +238,22 @@ def worker_main(args):
             continue
         
         frame_path = frame_files[local_frame_idx]
-        frame_image = np.array(Image.open(frame_path))
-        overlay = render_masklet_frame(frame_image, outputs, frame_idx=local_frame_idx)
+        out_filename = os.path.basename(frame_path)
         
-        # Naming Logic
-        out_filename = os.path.basename(frame_path) 
-        
+        # Re-calculate filename for saving (same logic as above)
         if args.video_start_timestamp and args.video_fps and args.video_fps > 0:
             try:
-                # Video Filename Frame Number (from extraction)
                 original_frame_num = int(os.path.splitext(os.path.basename(frame_path))[0])
-                
-                # Calculate time
                 time_offset_sec = original_frame_num / args.video_fps
                 frame_ts = args.video_start_timestamp + time_offset_sec
                 frame_dt = datetime.fromtimestamp(frame_ts)
-                
                 out_filename = frame_dt.strftime("%Y.%m.%d_%Hh%Mm%Ss_%f") + ".jpg"
-            except Exception as e:
-                print(f"Warning: Could not format timestamp for {frame_path}: {e}")
+            except Exception:
+                pass
 
+        frame_image = np.array(Image.open(frame_path))
+        overlay = render_masklet_frame(frame_image, outputs, frame_idx=local_frame_idx)
+        
         save_path = os.path.join(output_dir, out_filename)
         Image.fromarray(overlay).save(save_path)
     
@@ -341,9 +369,6 @@ def coordinator_main(args):
             if args.video_start_timestamp:
                 cmd.extend(["--video_start_timestamp", str(args.video_start_timestamp)])
             
-            if args.use_bfloat16:
-                cmd.append("--use_bfloat16")
-
             try:
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError as e:
